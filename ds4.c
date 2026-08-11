@@ -20203,7 +20203,7 @@ static int ds4_indexer_dump_parse_csv_u32(const char *s,
             end = end2;
         }
         out0[n] = (uint32_t)a;
-        out1[n] = (uint32_t)b;
+        if (out1) out1[n] = (uint32_t)b;
         n++;
         if (*end != ',') break;
         s = end + 1;
@@ -29459,6 +29459,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   (uint64_t)n_comp * n_tokens,
                                                   il,
                                                   pos0);
+                }
+                if (ok) {
+                    ds4_indexer_dump_samples(g,
+                                             il,
+                                             pos0,
+                                             n_tokens,
+                                             n_comp,
+                                             ratio,
+                                             index_scale,
+                                             metal_graph_indexer_scores(g),
+                                             metal_graph_batch_indexer_q(g),
+                                             metal_graph_batch_indexer_weights(g),
+                                             g->layer_index_comp_cache[il]);
                 }
                 if (ok) {
                     ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
