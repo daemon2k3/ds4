@@ -20163,6 +20163,189 @@ static bool metal_graph_indexer_stage_profile_boundary(
         uint32_t    n_tokens,
         uint32_t    n_comp,
         double     *stage_t0);
+
+/* Research instrumentation: dump indexer score/q/k/weights samples for the
+ * approximate (two-level + exact-pruning) indexer scoring feasibility study.
+ * Enabled via env:
+ *   DS4_INDEXER_DUMP_DIR=<dir>           (required to enable)
+ *   DS4_INDEXER_DUMP_LAYERS=2,22,42      (default: 2,22,42)
+ *   DS4_INDEXER_DUMP_TOKENS=32000:32037,117000:117037,496000:496037
+ *
+ * Writes per sampled token: <dir>/s_l<layer>_t<token>.bin
+ *   header: magic u32 'DSQI', ver u32, layer u32, token u32, pos0 u32,
+ *           n_comp u32, ratio u32, n_head u32, head_dim u32, scale f32
+ *   payload: scores[n_comp] f32, q[n_head*head_dim] f32, weights[n_head] f32
+ * Writes per (layer, chunk): <dir>/k_l<layer>_p<pos0>.bin  (same header)
+ *   payload: k[n_comp*128] f32                                             */
+#define DS4_INDEXER_DUMP_MAX_LAYERS 8
+#define DS4_INDEXER_DUMP_MAX_TOKENS 32
+
+static uint32_t ds4_indexer_dump_layers[DS4_INDEXER_DUMP_MAX_LAYERS];
+static int      ds4_indexer_dump_n_layers = -1;
+static uint32_t ds4_indexer_dump_tok0[DS4_INDEXER_DUMP_MAX_TOKENS];
+static uint32_t ds4_indexer_dump_tok1[DS4_INDEXER_DUMP_MAX_TOKENS];
+static int      ds4_indexer_dump_n_tokens = -1;
+
+static int ds4_indexer_dump_parse_csv_u32(const char *s,
+                                             uint32_t *out0,
+                                             uint32_t *out1,
+                                             int maxn) {
+    int n = 0;
+    while (s && *s && n < maxn) {
+        char *end = NULL;
+        long a = strtol(s, &end, 10);
+        if (end == s || a < 0) break;
+        long b = a;
+        if (*end == ':') {
+            char *end2 = NULL;
+            b = strtol(end + 1, &end2, 10);
+            if (end2 == end + 1 || b < a) break;
+            end = end2;
+        }
+        out0[n] = (uint32_t)a;
+        out1[n] = (uint32_t)b;
+        n++;
+        if (*end != ',') break;
+        s = end + 1;
+    }
+    return n;
+}
+
+static bool ds4_indexer_dump_want_layer(uint32_t il) {
+    if (ds4_indexer_dump_n_layers < 0) {
+        const char *s = getenv("DS4_INDEXER_DUMP_LAYERS");
+        ds4_indexer_dump_n_layers =
+            s && s[0] ? ds4_indexer_dump_parse_csv_u32(s,
+                                                       ds4_indexer_dump_layers,
+                                                       NULL,
+                                                       DS4_INDEXER_DUMP_MAX_LAYERS)
+                      : 3;
+        if (!s || !s[0]) {
+            ds4_indexer_dump_layers[0] = 2;
+            ds4_indexer_dump_layers[1] = 22;
+            ds4_indexer_dump_layers[2] = 42;
+        }
+    }
+    for (int i = 0; i < ds4_indexer_dump_n_layers; i++) {
+        if (ds4_indexer_dump_layers[i] == il) return true;
+    }
+    return false;
+}
+
+static int ds4_indexer_dump_n_samples(void) {
+    if (ds4_indexer_dump_n_tokens < 0) {
+        const char *s = getenv("DS4_INDEXER_DUMP_TOKENS");
+        ds4_indexer_dump_n_tokens =
+            s && s[0] ? ds4_indexer_dump_parse_csv_u32(s,
+                                                       ds4_indexer_dump_tok0,
+                                                       ds4_indexer_dump_tok1,
+                                                       DS4_INDEXER_DUMP_MAX_TOKENS)
+                      : 0;
+    }
+    return ds4_indexer_dump_n_tokens;
+}
+
+static void ds4_indexer_dump_samples(
+        const ds4_gpu_graph      *g,
+        uint32_t                  il,
+        uint32_t                  pos0,
+        uint32_t                  n_tokens,
+        uint32_t                  n_comp,
+        uint32_t                  ratio,
+        float                     scale,
+        const ds4_gpu_tensor     *scores,
+        const ds4_gpu_tensor     *indexer_q,
+        const ds4_gpu_tensor     *weights,
+        const ds4_gpu_tensor     *index_comp) {
+    if (getenv("DS4_INDEXER_DUMP_DIR") == NULL) return;
+    const int ns = ds4_indexer_dump_n_samples();
+    if (ns <= 0 || !ds4_indexer_dump_want_layer(il)) return;
+    bool any = false;
+    for (int i = 0; i < ns && !any; i++) {
+        if ((uint32_t)ds4_indexer_dump_tok0[i] < pos0 + n_tokens &&
+            (uint32_t)ds4_indexer_dump_tok1[i] >= pos0) any = true;
+    }
+    if (!any) return;
+
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: indexer dump failed to synchronize\n");
+        return;
+    }
+    const char *dir = getenv("DS4_INDEXER_DUMP_DIR");
+
+    /* k file (once per layer-chunk) */
+    {
+        char path[1200];
+        snprintf(path, sizeof(path), "%s/k_l%u_p%u.bin", dir, il, pos0);
+        FILE *fp = fopen(path, "rb");
+        if (fp) fclose(fp);
+        if (!fp) {
+            fp = fopen(path, "wb");
+            if (fp) {
+                const uint32_t hdr[9] = {0x49535144u, 1u, il, 0u, pos0,
+                                         n_comp, ratio, 64u, 128u};
+                fwrite(hdr, sizeof(uint32_t), 9, fp);
+                fwrite(&scale, sizeof(float), 1, fp);
+                float *kb = xmalloc((size_t)n_comp * 128u * sizeof(float));
+                if (ds4_gpu_tensor_read(index_comp, 0, kb,
+                                        (size_t)n_comp * 128u * sizeof(float)) != 0) {
+                    fwrite(kb, sizeof(float), (size_t)n_comp * 128u, fp);
+                }
+                free(kb);
+                fclose(fp);
+                fprintf(stderr, "ds4: indexer dump k layer %u pos0 %u -> %s\n",
+                        il, pos0, path);
+            }
+        }
+    }
+
+    for (int i = 0; i < ns; i++) {
+        for (uint32_t p = ds4_indexer_dump_tok0[i];
+             p <= ds4_indexer_dump_tok1[i] && p < pos0 + n_tokens; p++) {
+            if (p < pos0) continue;
+            const uint64_t t = (uint64_t)(p - pos0);
+            char path[1200];
+            snprintf(path, sizeof(path), "%s/s_l%u_t%u.bin", dir, il, p);
+            FILE *fp = fopen(path, "wb");
+            if (!fp) continue;
+            const uint32_t hdr[9] = {0x49535144u, 1u, il, p, pos0,
+                                     n_comp, ratio, 64u, 128u};
+            fwrite(hdr, sizeof(uint32_t), 9, fp);
+            fwrite(&scale, sizeof(float), 1, fp);
+            float *sb = xmalloc((size_t)n_comp * sizeof(float));
+            float *qb = xmalloc((size_t)64u * 128u * sizeof(float));
+            float wb[64];
+            if (ds4_gpu_tensor_read(scores,
+                                    t * (uint64_t)n_comp * sizeof(float),
+                                    sb, (size_t)n_comp * sizeof(float)) == 0) {
+                fprintf(stderr, "ds4: indexer dump score read failed\n");
+            }
+            if (ds4_gpu_tensor_read(indexer_q,
+                                    t * (uint64_t)64u * 128u * sizeof(float),
+                                    qb, (size_t)64u * 128u * sizeof(float)) == 0) {
+                fprintf(stderr, "ds4: indexer dump q read failed\n");
+            }
+            if (ds4_gpu_tensor_read(weights,
+                                    t * (uint64_t)64u * sizeof(float),
+                                    wb, sizeof(wb)) == 0) {
+                fprintf(stderr, "ds4: indexer dump weights read failed\n");
+            }
+            fwrite(sb, sizeof(float), (size_t)n_comp, fp);
+            fwrite(qb, sizeof(float), (size_t)64u * 128u, fp);
+            fwrite(wb, sizeof(float), 64, fp);
+            fclose(fp);
+            fprintf(stderr, "ds4: indexer dump s layer %u token %u -> %s\n",
+                    il, p, path);
+            free(sb);
+            free(qb);
+        }
+    }
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after indexer dump\n");
+    }
+}
+
 static bool metal_graph_layer_stage_profile_boundary(
         const char *part,
         const char *stage,
@@ -29396,6 +29579,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                               (uint64_t)n_comp * n_tokens,
                                               il,
                                               pos0);
+            }
+            if (ok) {
+                ds4_indexer_dump_samples(g,
+                                         il,
+                                         pos0,
+                                         n_tokens,
+                                         n_comp,
+                                         ratio,
+                                         index_scale,
+                                         metal_graph_indexer_scores(g),
+                                         metal_graph_batch_indexer_q(g),
+                                         metal_graph_batch_indexer_weights(g),
+                                         g->layer_index_comp_cache[il]);
             }
             if (ok) {
                 ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
