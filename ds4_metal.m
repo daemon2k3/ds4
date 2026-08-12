@@ -6302,6 +6302,7 @@ typedef struct {
     uint32_t head_dim;
     uint32_t pos0;
     uint32_t ratio;
+    uint32_t llt_pre_F3;   /* must mirror metal/dsv4_misc.metal struct layout */
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t weights_token_stride;
@@ -17445,6 +17446,7 @@ int ds4_gpu_indexer_score_one_tensor(
                 .head_dim = head_dim,
                 .pos0 = 0,
                 .ratio = 4,
+                .llt_pre_F3 = getenv("DS4_METAL_DISABLE_INDEXER_LLT_F3") != NULL ? 1u : 0u,
                 .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
                 .q_head_stride = (uint64_t)head_dim * sizeof(float),
                 .weights_token_stride = (uint64_t)n_head * sizeof(float),
@@ -17611,13 +17613,6 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
             llt_name = "kernel_dsv4_indexer_scores_llt_nsg4";
         }
-        /* A/B vs pre-F3 shape (scalar staging, single Q bank):
-         * DS4_METAL_DISABLE_INDEXER_LLT_F3=1 */
-        if (getenv("DS4_METAL_DISABLE_INDEXER_LLT_F3") != NULL) {
-            static char llt_name_pre[64];
-            snprintf(llt_name_pre, sizeof(llt_name_pre), "%s_pre", llt_name);
-            llt_name = llt_name_pre;
-        }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32"
@@ -17632,6 +17627,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             .head_dim = head_dim,
             .pos0 = pos0,
             .ratio = ratio,
+            .llt_pre_F3 = getenv("DS4_METAL_DISABLE_INDEXER_LLT_F3") != NULL ? 1u : 0u,
             .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
             .q_head_stride = (uint64_t)head_dim * sizeof(float),
             .weights_token_stride = (uint64_t)n_head * sizeof(float),

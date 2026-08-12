@@ -88,6 +88,7 @@ struct ds4_metal_args_dsv4_indexer_scores_fused {
     uint32_t head_dim;
     uint32_t pos0;
     uint32_t ratio;
+    uint32_t llt_pre_F3;   /* 1: pre-F3 loop shape (single Q bank + scalar staging) */
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t weights_token_stride;
@@ -6402,7 +6403,7 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
         // Double-buffered Q: stage tile t+1 into the alternate sq/sw bank
         // while tile t's MMA consumes the current bank (device-latency hidden).
         constexpr uint NTILE = NH / NHPTG;
-        if (PRE == 0u) {
+        if (args.llt_pre_F3 == 0u) {
             // Pre-stage head tile 0 into bank 0 (vectorized staging).
             for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
                 const uint ih = i4 / DK;
@@ -6432,11 +6433,11 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
 
         for (uint tile = 0; tile < NTILE; tile++) {
             const uint cur = tile & 1u;
-            threadgroup half  *sqc = sq + (PRE == 0u ? cur : 0u) * NHPTG*DK;
-            threadgroup float *swc = sw + (PRE == 0u ? cur : 0u) * NHPTG;
+            threadgroup half  *sqc = sq + (args.llt_pre_F3 == 0u ? cur : 0u) * NHPTG*DK;
+            threadgroup float *swc = sw + (args.llt_pre_F3 == 0u ? cur : 0u) * NHPTG;
             // Prefetch tile t+1 into the other bank (no barrier needed yet:
             // the MMA below reads the other bank exclusively).
-            if (PRE == 0u && tile + 1 < NTILE) {
+            if (args.llt_pre_F3 == 0u && tile + 1 < NTILE) {
                 const uint nxt_head = (tile + 1) * NHPTG;
                 threadgroup half  *sqn = sq + (cur ^ 1u) * NHPTG*DK;
                 threadgroup float *swn = sw + (cur ^ 1u) * NHPTG;
