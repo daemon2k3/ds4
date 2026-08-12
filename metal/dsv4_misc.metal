@@ -6333,7 +6333,7 @@ kernel void kernel_dsv4_indexer_scores_tiled(
  * matrix steps over depth 128 in ascending order, relu then w*scale per
  * head in ascending head order, and ds4's causal (-inf) epilogue for
  * multi-token (prefill) calls / all-rows pass-through for decode. */
-template <int NBPTG, int T_NSG, uint32_t PRE>
+template <int NBPTG, int T_NSG>
 kernel void kernel_dsv4_indexer_scores_llt_impl(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
