@@ -20259,12 +20259,18 @@ static void ds4_indexer_dump_samples(
         const ds4_gpu_tensor     *index_comp) {
     if (getenv("DS4_INDEXER_DUMP_DIR") == NULL) return;
     const int ns = ds4_indexer_dump_n_samples();
-    if (ns <= 0 || !ds4_indexer_dump_want_layer(il)) return;
+    const bool wl = ds4_indexer_dump_want_layer(il);
     bool any = false;
     for (int i = 0; i < ns && !any; i++) {
         if ((uint32_t)ds4_indexer_dump_tok0[i] < pos0 + n_tokens &&
             (uint32_t)ds4_indexer_dump_tok1[i] >= pos0) any = true;
     }
+    if (il == 2 || any) {
+        fprintf(stderr,
+                "ds4: indexer-dump gate il=%u pos0=%u tokens=%u comp=%u ns=%d want_layer=%d any=%d\n",
+                il, pos0, n_tokens, n_comp, ns, wl ? 1 : 0, any ? 1 : 0);
+    }
+    if (ns <= 0 || !wl) return;
     if (!any) return;
 
     if (ds4_gpu_synchronize() == 0) {
