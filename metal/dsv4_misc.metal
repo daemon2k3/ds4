@@ -6488,14 +6488,10 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
 
 typedef decltype(kernel_dsv4_indexer_scores_llt_impl<1,1>) kernel_dsv4_llt_t;
 /* Default NBPTG=8; 16 and 32 trade grid occupancy for amortized K staging. */
-template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, 0>;
-template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8, 0>;
-template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8, 0>;
-template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4, 0>;
-template [[host_name("kernel_dsv4_indexer_scores_llt_pre")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, 1>;
-template [[host_name("kernel_dsv4_indexer_scores_llt16_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8, 1>;
-template [[host_name("kernel_dsv4_indexer_scores_llt32_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8, 1>;
-template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4, 1>;
+template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
