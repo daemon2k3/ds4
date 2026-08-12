@@ -17014,7 +17014,7 @@ static bool metal_graph_alloc_raw_cap(
         /* The non-replay compressor path rewrites the whole [0..n_comp) span
          * into the cache-bound tensor each chunk, so with DSpark capture (which
          * forces that path) the stage MUST cover the full cache span. */
-        g->index_comp_f32_stage_rows = comp_cap;
+        g->index_comp_f32_stage_rows = g->comp_cap;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) {
