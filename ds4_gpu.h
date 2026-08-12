@@ -463,6 +463,22 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd);
 
+/* f16 indexer compressed-K cache support (F2): runtime flag, set once at
+ * graph init (0 = legacy f32 cache - required on NAX/M5 devices; default-on
+ * via ds4 env rollback DS4_METAL_DISABLE_INDEXER_COMP_F16). */
+int ds4_gpu_indexer_comp_f16_set(int enabled);
+int ds4_gpu_indexer_comp_f16_get(void);
+/* dtype-aware row copies for the f16 cache (contiguous n_elems = rows*128). */
+int ds4_gpu_indexer_comp_f32_to_f16(ds4_gpu_tensor       *dst_f16,
+                                    uint64_t              dst_off_bytes,
+                                    const ds4_gpu_tensor *src_f32,
+                                    uint64_t              src_off_bytes,
+                                    uint32_t              n_elems);
+int ds4_gpu_indexer_comp_f16_to_f32(ds4_gpu_tensor       *dst_f32,
+                                    uint64_t              dst_off_bytes,
+                                    const ds4_gpu_tensor *src_f16,
+                                    uint64_t              src_off_bytes,
+                                    uint32_t              n_elems);
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

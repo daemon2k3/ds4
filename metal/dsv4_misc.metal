@@ -88,6 +88,7 @@ struct ds4_metal_args_dsv4_indexer_scores_fused {
     uint32_t head_dim;
     uint32_t pos0;
     uint32_t ratio;
+    uint32_t index_comp_f16;   /* 1: indexer K cache rows are f16 (bit-identical to half(f32) staging) */
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t weights_token_stride;
@@ -421,9 +422,10 @@ kernel void kernel_dsv4_indexer_score_one_direct(
     threadgroup float *psum = ktg + 128u;   // [4]
 
     if (tid < 128u) {
-        device const float *krow = (device const float *)(index_comp +
+        device const char *krow = (device const char *)(index_comp +
             (uint64_t)row * args.index_row_stride);
-        ktg[tid] = krow[tid];
+        ktg[tid] = args.index_comp_f16 != 0u ? float(*(device const half *)(krow + tid * 2u))
+                                             : *(device const float *)(krow + tid * 4u);
     }
 
     float acc = 0.0f;
@@ -6088,9 +6090,10 @@ kernel void kernel_dsv4_indexer_scores_tiled_f32(
         const uint comp = c0 + cc;
         float v = 0.0f;
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
+            device const char *row = (device const char *)(index_comp +
                 (uint64_t)comp * args.index_row_stride);
-            v = row[d];
+            v = args.index_comp_f16 != 0u ? float(*(device const half *)(row + d * 2u))
+                                          : *(device const float *)(row + d * 4u);
         }
         ktg[i] = v;
     }
@@ -6227,9 +6230,10 @@ kernel void kernel_dsv4_indexer_scores_tiled(
         const uint comp = c0 + cc;
         half v = half(0.0f);
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
+            device const char *row = (device const char *)(index_comp +
                 (uint64_t)comp * args.index_row_stride);
-            v = half(row[d]);
+            v = args.index_comp_f16 != 0u ? *(device const half *)(row + d * 2u)
+                                          : half(*(device const float *)(row + d * 4u));
         }
         ktg[i] = v;
     }
@@ -6371,9 +6375,10 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
         const uint comp = i_kv_0 + ik;
         half4 v = half4(0.0h);
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
+            device const char *row = (device const char *)(index_comp +
                 (uint64_t)comp * args.index_row_stride);
-            v = half4(((device const float4 *)row)[d >> 2]);
+            v = args.index_comp_f16 != 0u ? *(device const half4 *)(row + d * 2u)
+                                          : half4(((device const float4 *)row)[d >> 2]);
         }
         *(threadgroup half4 *)(sk + i4) = v;
     }

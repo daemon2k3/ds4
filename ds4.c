@@ -14979,6 +14979,24 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 DS4_GPU_ATTN_COMP_CACHE_F16
 
+/* F2: f16 indexer compressed-K cache. Bit-identical for all score kernels that
+ * already read half(f32 row) before MMA; halves decode-score bytes (roofline
+ * 25 -> 51 TFLOP/s) and cache memory (-67 MiB/layer-tier @1M ctx). Off when the
+ * NAX/TensorOps path is in use (M5 devices) or via
+ * DS4_METAL_DISABLE_INDEXER_COMP_F16=1. The fp8-QAT compressor output IS the
+ * e4m3-sim f32 value that every score kernel converts with half() before MMA,
+ * so writing half(QAT row) to cache feeds bit-identical inputs. */
+static int metal_graph_indexer_comp_f16_cached = -1;
+static int metal_graph_indexer_comp_f16(void) {
+    if (metal_graph_indexer_comp_f16_cached < 0) {
+        metal_graph_indexer_comp_f16_cached =
+            ds4_env_cached("DS4_METAL_DISABLE_INDEXER_COMP_F16") == NULL &&
+            !ds4_gpu_mpp_available() ? 1 : 0;
+        (void)ds4_gpu_indexer_comp_f16_set(metal_graph_indexer_comp_f16_cached);
+    }
+    return metal_graph_indexer_comp_f16_cached;
+}
+
 /* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
@@ -15032,6 +15050,8 @@ typedef struct {
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *index_comp_f32_stage_by_tier[DS4_MAX_GPUS]; /* f16 mode: f32 write/convert stage */
+    uint32_t        index_comp_f32_stage_rows;
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_raw_cache_tp[DS4_MAX_LAYER];
@@ -15396,6 +15416,7 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(comp_sc_cur)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(index_comp_kv_cur)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(index_comp_sc_cur)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(attn_comp_stage)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(index_comp_f32_stage)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_q)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_weights)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_scores)
@@ -15820,6 +15841,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_comp_sc_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_kv_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->attn_comp_stage_by_tier[t]);
+        ds4_gpu_tensor_free(g->index_comp_f32_stage_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_selected_by_tier[t]);
         ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
@@ -16141,7 +16163,8 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         bytes += comp_cap * DS4_N_HEAD_DIM *
                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
         if (ratio == 4) {
-            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     (metal_graph_indexer_comp_f16() ? sizeof(uint16_t) : sizeof(float));
         }
     }
     return bytes;
@@ -16987,6 +17010,10 @@ static bool metal_graph_alloc_raw_cap(
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
+    if (metal_graph_indexer_comp_f16()) {
+        g->index_comp_f32_stage_rows = prefill_cap / 4u + 2u;
+        if (g->index_comp_f32_stage_rows < 2u) g->index_comp_f32_stage_rows = 2u;
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) {
             g->layer_comp_cap[il] = 0;
@@ -17175,7 +17202,8 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tier,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM *
+                        (metal_graph_indexer_comp_f16() ? sizeof(uint16_t) : sizeof(float)));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_frontier_snapshot) {
@@ -17224,6 +17252,11 @@ static bool metal_graph_alloc_raw_cap(
              * the F16-cache mode is enabled (the non-F16 path stages in-place). */
             g->attn_comp_stage_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                     (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM * sizeof(float));
+        }
+        if (metal_graph_indexer_comp_f16()) {
+            g->index_comp_f32_stage_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+                    (uint64_t)g->index_comp_f32_stage_rows *
+                    DS4_N_INDEXER_HEAD_DIM * sizeof(float));
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
@@ -17458,6 +17491,7 @@ static bool metal_graph_alloc_raw_cap(
             g->attn_cur_by_tier[t] && g->attn_norm_by_tier[t] && g->qr_by_tier[t] && g->qr_norm_by_tier[t] &&
             g->q_by_tier[t] && g->kv_raw_by_tier[t] && g->kv_by_tier[t] &&
             g->comp_kv_cur_by_tier[t] && g->comp_sc_cur_by_tier[t] &&
+            (!metal_graph_indexer_comp_f16() || g->index_comp_f32_stage_by_tier[t]) &&
             g->index_comp_kv_cur_by_tier[t] && g->index_comp_sc_cur_by_tier[t] &&
             (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage_by_tier[t]) &&
             g->indexer_q_by_tier[t] && g->indexer_weights_by_tier[t] && g->indexer_scores_by_tier[t] &&
@@ -22858,7 +22892,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                             metal_graph_comp_sc_cur(g),
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
-                                                            g->layer_index_comp_cache[il],
+                                                            metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                                                          : g->layer_index_comp_cache[il],
                                                             model->map,
                                                             model->size,
                                                             layer->indexer_compressor_ape->abs_offset,
@@ -22868,7 +22903,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                             DS4_N_INDEXER_HEAD_DIM,
                                                             ratio,
                                                             pos,
-                                                            index_row,
+                                                            metal_graph_indexer_comp_f16() ? 0 : index_row,
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -22893,8 +22928,9 @@ static bool metal_graph_encode_decode_layer_phase(
                         g->layer_attn_comp_cache[il],
                         comp_row,
                         layer->attn_compressor_norm->abs_offset,
-                        g->layer_index_comp_cache[il],
-                        index_row,
+                        metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                       : g->layer_index_comp_cache[il],
+                        metal_graph_indexer_comp_f16() ? 0 : index_row,
                         layer->indexer_compressor_norm->abs_offset,
                         g->layer_attn_state_kv[il],
                         g->layer_attn_state_score[il],
@@ -22916,7 +22952,9 @@ static bool metal_graph_encode_decode_layer_phase(
             if (ok && emit && !comp_finalize_fuse) {
 #if defined(__APPLE__)
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                        g->layer_index_comp_cache[il],
+                        metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                       : g->layer_index_comp_cache[il],
+                        metal_graph_indexer_comp_f16() ? 0 :
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                         (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 if (!index_row_view) {
@@ -22931,7 +22969,9 @@ static bool metal_graph_encode_decode_layer_phase(
                 ds4_gpu_tensor index_row_view;
                 if (!metal_graph_borrow_tensor_view(
                         &index_row_view,
-                        g->layer_index_comp_cache[il],
+                        metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                       : g->layer_index_comp_cache[il],
+                        metal_graph_indexer_comp_f16() ? 0 :
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                         (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float))) {
                     ok = false;
@@ -22942,6 +22982,14 @@ static bool metal_graph_encode_decode_layer_phase(
                 }
 #endif
                 DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_qat");
+            }
+            if (ok && emit && metal_graph_indexer_comp_f16()) {
+                ok = ds4_gpu_indexer_comp_f32_to_f16(
+                        g->layer_index_comp_cache[il],
+                        (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
+                        metal_graph_index_comp_f32_stage(g),
+                        0,
+                        DS4_N_INDEXER_HEAD_DIM) != 0;
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_sparse_threshold =
@@ -29021,8 +29069,16 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                if (ok && metal_graph_indexer_comp_f16() && n_comp > g->index_comp_f32_stage_rows) {
+                    fprintf(stderr, "ds4: Metal indexer comp stage rows exceeded\n");
+                    ok = false;
+                }
+                ds4_gpu_tensor *index_comp_target = !ok ? NULL :
+                    metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                   : g->layer_index_comp_cache[il];
+                if (ok && !index_comp_target) ok = false;
                 if (ok) {
-                    ok = ds4_gpu_compressor_prefill_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_compressor_prefill_tensor(index_comp_target,
                                                              g->layer_index_state_kv[il],
                                                              g->layer_index_state_score[il],
                                                              metal_graph_batch_comp_kv(g),
@@ -29049,9 +29105,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              DS4_RMS_EPS) != 0;
                 }
                 if (ok && n_comp != 0) {
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_comp_target,
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+                    /* F2: post-QAT f32->f16; bit-identical to half(f32) staging
+                     * in every score kernel (same IEEE RNE rounding via cpy). */
+                    if (ok && metal_graph_indexer_comp_f16()) {
+                        ok = ds4_gpu_indexer_comp_f32_to_f16(
+                                g->layer_index_comp_cache[il],
+                                0,
+                                index_comp_target,
+                                0,
+                                n_comp * DS4_N_INDEXER_HEAD_DIM) != 0;
+                    }
                 }
                 if (ok) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -29102,9 +29168,17 @@ static bool metal_graph_encode_layer_attention_batch(
                         ok = false;
                     }
                     ds4_gpu_tensor *index_view = NULL;
+                    if (ok && metal_graph_indexer_comp_f16() && index_chunk > g->index_comp_f32_stage_rows) {
+                        fprintf(stderr, "ds4: Metal indexer comp stage rows exceeded\n");
+                        ok = false;
+                    }
                     if (ok) {
+                        /* f16: replay into stage rows [0..chunk), then QAT+convert;
+                         * the cache byte offset is applied at conversion time. */
                         index_view = ds4_gpu_tensor_view(
-                                g->layer_index_comp_cache[il],
+                                metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                               : g->layer_index_comp_cache[il],
+                                metal_graph_indexer_comp_f16() ? 0 :
                                 (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                 (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                         ok = index_view != NULL;
@@ -29140,6 +29214,14 @@ static bool metal_graph_encode_layer_attention_batch(
                         ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
                                                               index_chunk,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
+                        if (ok && metal_graph_indexer_comp_f16()) {
+                            ok = ds4_gpu_indexer_comp_f32_to_f16(
+                                    g->layer_index_comp_cache[il],
+                                    (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
+                                    metal_graph_index_comp_f32_stage(g),
+                                    (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    index_chunk * DS4_N_INDEXER_HEAD_DIM) != 0;
+                        }
                     }
                     if (ok) {
                         ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -29195,7 +29277,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 sc_view,
                                                                 g->layer_index_state_kv[il],
                                                                 g->layer_index_state_score[il],
-                                                                g->layer_index_comp_cache[il],
+                                                                metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                                                              : g->layer_index_comp_cache[il],
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -29205,7 +29288,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 ratio,
                                                                 pos,
-                                                                index_row,
+                                                                metal_graph_indexer_comp_f16() ? 0 : index_row,
                                                                 DS4_N_ROT,
                                                                 compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                                 freq_base,
@@ -29220,7 +29303,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 false) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                                    g->layer_index_comp_cache[il],
+                                    metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
+                                                                   : g->layer_index_comp_cache[il],
+                                    metal_graph_indexer_comp_f16() ? 0 :
                                     (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                     (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                             if (!index_row_view) {
@@ -29231,6 +29316,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                       DS4_N_INDEXER_HEAD_DIM) != 0;
                                 ds4_gpu_tensor_free(index_row_view);
                             }
+                        }
+                        if (ok && emit && metal_graph_indexer_comp_f16()) {
+                            ok = ds4_gpu_indexer_comp_f32_to_f16(
+                                    g->layer_index_comp_cache[il],
+                                    (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
+                                    metal_graph_index_comp_f32_stage(g),
+                                    0,
+                                    DS4_N_INDEXER_HEAD_DIM) != 0;
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
@@ -36644,7 +36737,20 @@ static int metal_graph_prompt_logits_test(
                 if (n_index != 0 && g.layer_index_comp_cache[il]) {
                     const uint64_t ni = (uint64_t)n_index * DS4_N_INDEXER_HEAD_DIM;
                     float *gpu_index = xmalloc((size_t)ni * sizeof(float));
-                    if (ds4_gpu_tensor_read(g.layer_index_comp_cache[il], 0, gpu_index, ni * sizeof(float)) != 0) {
+                    bool index_read = false;
+                    if (metal_graph_indexer_comp_f16()) {
+                        uint16_t *gpu_index_h = xmalloc((size_t)ni * sizeof(uint16_t));
+                        if (ds4_gpu_tensor_read(g.layer_index_comp_cache[il], 0,
+                                                gpu_index_h, ni * sizeof(uint16_t)) != 0) {
+                            for (uint64_t i = 0; i < ni; i++) gpu_index[i] = f16_to_f32(gpu_index_h[i]);
+                            index_read = true;
+                        }
+                        free(gpu_index_h);
+                    } else {
+                        index_read = ds4_gpu_tensor_read(g.layer_index_comp_cache[il], 0,
+                                                         gpu_index, ni * sizeof(float)) != 0;
+                    }
+                    if (index_read) {
                         fprintf(stderr,
                                 "ds4: comp trace layer %u n=%u index_max=%g index_rms=%g\n",
                                 il, n_index,
@@ -49903,6 +50009,73 @@ static bool glm_layer_payload_tensor_bytes(uint32_t layer,
  * it; both would be poor fits for this very large model. */
 static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
+                                     uint8_t *buf, size_t cap, char *err, size_t errlen);
+static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
+                                    uint64_t offset, uint64_t bytes,
+                                    uint8_t *buf, size_t cap, uint64_t *remaining,
+                                    char *err, size_t errlen);
+
+/* F2: index_comp cache disk I/O stays in the legacy f32 row format for
+ * cross-version compatibility. With the f16 cache, conversion runs chunked
+ * through the graph's f32 stage tensor and the Metal cpy kernels (same IEEE
+ * RNE rounding as the half(f32) score staging). */
+static int payload_write_index_comp_span(FILE *fp, ds4_gpu_graph *g,
+                                         ds4_gpu_tensor *cache,
+                                         uint64_t n_rows, uint32_t head_dim,
+                                         uint8_t *buf, size_t cap,
+                                         char *err, size_t errlen) {
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const uint64_t n = (n_rows - done) < (uint64_t)g->index_comp_f32_stage_rows
+                           ? (n_rows - done) : (uint64_t)g->index_comp_f32_stage_rows;
+        if (!ds4_gpu_indexer_comp_f16_to_f32(g->index_comp_f32_stage_by_tier[0],
+                                             0,
+                                             cache,
+                                             (done + 0ull) * head_dim * sizeof(uint16_t),
+                                             (uint32_t)(n * head_dim))) {
+            payload_set_err(err, errlen, "indexer comp f16->f32 conversion failed");
+            return 1;
+        }
+        if (payload_write_tensor_span(fp, g->index_comp_f32_stage_by_tier[0],
+                                      0, n * head_dim * sizeof(float),
+                                      buf, cap, err, errlen) != 0) {
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+static int payload_read_index_comp_span(FILE *fp, ds4_gpu_graph *g,
+                                        ds4_gpu_tensor *cache,
+                                        uint64_t n_rows, uint32_t head_dim,
+                                        uint8_t *buf, size_t cap,
+                                        uint64_t *remaining,
+                                        char *err, size_t errlen) {
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const uint64_t n = (n_rows - done) < (uint64_t)g->index_comp_f32_stage_rows
+                           ? (n_rows - done) : (uint64_t)g->index_comp_f32_stage_rows;
+        if (payload_read_tensor_span(fp, g->index_comp_f32_stage_by_tier[0],
+                                     0, n * head_dim * sizeof(float),
+                                     buf, cap, remaining, err, errlen) != 0) {
+            return 1;
+        }
+        if (!ds4_gpu_indexer_comp_f32_to_f16(cache,
+                                             done * head_dim * sizeof(uint16_t),
+                                             g->index_comp_f32_stage_by_tier[0],
+                                             0,
+                                             (uint32_t)(n * head_dim))) {
+            payload_set_err(err, errlen, "indexer comp f32->f16 conversion failed");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
+                                     uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (!tensor || offset > ds4_gpu_tensor_bytes(tensor) ||
         bytes > ds4_gpu_tensor_bytes(tensor) - offset)
@@ -50487,7 +50660,17 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
+            rc = metal_graph_indexer_comp_f16()
+                 ? payload_write_index_comp_span(fp,
+                                                 g,
+                                                 g->layer_index_comp_cache[il],
+                                                 (uint64_t)g->layer_n_index_comp[il],
+                                                 DS4_N_INDEXER_HEAD_DIM,
+                                                 buf,
+                                                 DS4_SESSION_IO_CHUNK,
+                                                 err,
+                                                 errlen)
+                 : payload_write_tensor_span(fp,
                                            g->layer_index_comp_cache[il],
                                            0,
                                            (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -50905,7 +51088,18 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
+            rc = metal_graph_indexer_comp_f16()
+                 ? payload_read_index_comp_span(fp,
+                                                g,
+                                                g->layer_index_comp_cache[il],
+                                                (uint64_t)n_index_comp[i],
+                                                DS4_N_INDEXER_HEAD_DIM,
+                                                buf,
+                                                DS4_SESSION_IO_CHUNK,
+                                                &remaining,
+                                                err,
+                                                errlen)
+                 : payload_read_tensor_span(fp,
                                           g->layer_index_comp_cache[il],
                                           0,
                                           (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -51551,7 +51745,17 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
+            rc = metal_graph_indexer_comp_f16()
+                 ? payload_write_index_comp_span(fp,
+                                                 g,
+                                                 g->layer_index_comp_cache[il],
+                                                 (uint64_t)g->layer_n_index_comp[il],
+                                                 DS4_N_INDEXER_HEAD_DIM,
+                                                 buf,
+                                                 DS4_SESSION_IO_CHUNK,
+                                                 err,
+                                                 errlen)
+                 : payload_write_tensor_span(fp,
                                            g->layer_index_comp_cache[il],
                                            0,
                                            (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -52087,7 +52291,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
+            rc =             rc = metal_graph_indexer_comp_f16()
+                 ? payload_read_index_comp_span(fp,
+                                                g,
+                                                g->layer_index_comp_cache[il],
+                                                (uint64_t)n_index_comp[il],
+                                                DS4_N_INDEXER_HEAD_DIM,
+                                                buf,
+                                                DS4_SESSION_IO_CHUNK,
+                                                &remaining,
+                                                err,
+                                                errlen)
+                 : payload_read_tensor_span(fp,
                                           g->layer_index_comp_cache[il],
                                           0,
                                           (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
