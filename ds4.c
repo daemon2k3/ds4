@@ -17011,8 +17011,10 @@ static bool metal_graph_alloc_raw_cap(
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
     if (metal_graph_indexer_comp_f16()) {
-        g->index_comp_f32_stage_rows = prefill_cap / 4u + 2u;
-        if (g->index_comp_f32_stage_rows < 2u) g->index_comp_f32_stage_rows = 2u;
+        /* The non-replay compressor path rewrites the whole [0..n_comp) span
+         * into the cache-bound tensor each chunk, so with DSpark capture (which
+         * forces that path) the stage MUST cover the full cache span. */
+        g->index_comp_f32_stage_rows = comp_cap;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) {
@@ -29077,6 +29079,8 @@ static bool metal_graph_encode_layer_attention_batch(
                     metal_graph_indexer_comp_f16() ? metal_graph_index_comp_f32_stage(g)
                                                    : g->layer_index_comp_cache[il];
                 if (ok && !index_comp_target) ok = false;
+                const uint32_t index_before_span = ok && metal_graph_indexer_comp_f16()
+                    ? g->layer_n_index_comp[il] : 0u;
                 if (ok) {
                     ok = ds4_gpu_compressor_prefill_tensor(index_comp_target,
                                                              g->layer_index_state_kv[il],
@@ -29108,15 +29112,17 @@ static bool metal_graph_encode_layer_attention_batch(
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(index_comp_target,
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-                    /* F2: post-QAT f32->f16; bit-identical to half(f32) staging
-                     * in every score kernel (same IEEE RNE rounding via cpy). */
-                    if (ok && metal_graph_indexer_comp_f16()) {
+                    /* F2: post-QAT f32->f16 delta (rows [index_before_span..n_comp));
+                     * older rows' QAT output is elementwise-deterministic, so
+                     * their cached f16 rows remain valid. Bit-identical to the
+                     * half(f32) staging every score kernel does (same rounding). */
+                    if (ok && metal_graph_indexer_comp_f16() && n_comp > index_before_span) {
                         ok = ds4_gpu_indexer_comp_f32_to_f16(
                                 g->layer_index_comp_cache[il],
-                                0,
+                                (uint64_t)index_before_span * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
                                 index_comp_target,
-                                0,
-                                n_comp * DS4_N_INDEXER_HEAD_DIM) != 0;
+                                (uint64_t)index_before_span * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                (n_comp - index_before_span) * DS4_N_INDEXER_HEAD_DIM) != 0;
                     }
                 }
                 if (ok) {
