@@ -17435,6 +17435,7 @@ int ds4_gpu_indexer_score_one_tensor(
                                                       : "kernel_dsv4_indexer_scores_llt")
                     : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
+            }
             if (!direct_pipeline) return 0;
 
             ds4_gpu_dsv4_indexer_scores_fused_args args = {
