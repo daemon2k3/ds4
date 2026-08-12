@@ -14989,10 +14989,10 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 static int metal_graph_indexer_comp_f16_cached = -1;
 static int metal_graph_indexer_comp_f16(void) {
     if (metal_graph_indexer_comp_f16_cached < 0) {
-        metal_graph_indexer_comp_f16_cached =
-            ds4_env_cached("DS4_METAL_DISABLE_INDEXER_COMP_F16") == NULL &&
-            !ds4_gpu_mpp_available() ? 1 : 0;
-        (void)ds4_gpu_indexer_comp_f16_set(metal_graph_indexer_comp_f16_cached);
+        (void)ds4_gpu_indexer_comp_f16_set(
+            ds4_env_cached("DS4_METAL_DISABLE_INDEXER_COMP_F16") == NULL ? 1 : 0);
+        /* the setter folds in device rules (NAX/M5 forces the f32 cache) */
+        metal_graph_indexer_comp_f16_cached = ds4_gpu_indexer_comp_f16_get();
     }
     return metal_graph_indexer_comp_f16_cached;
 }
@@ -52291,7 +52291,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc =             rc = metal_graph_indexer_comp_f16()
+            rc = metal_graph_indexer_comp_f16()
                  ? payload_read_index_comp_span(fp,
                                                 g,
                                                 g->layer_index_comp_cache[il],

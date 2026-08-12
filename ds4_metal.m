@@ -17369,6 +17369,19 @@ static void ds4_gpu_use_q4_expert_table_resources(
     }
 }
 
+static int g_indexer_comp_f16 = 1;
+
+int ds4_gpu_indexer_comp_f16_set(int enabled) {
+    /* NAX/TensorOps (M5) devices keep the f32 cache: the NAX score kernel
+     * stages K with its own float4 loads, which assume f32 rows. */
+    g_indexer_comp_f16 = (enabled && !ds4_gpu_mpp_available()) ? 1 : 0;
+    return 1;
+}
+
+int ds4_gpu_indexer_comp_f16_get(void) {
+    return g_indexer_comp_f16;
+}
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -21447,17 +21460,6 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     }
 
     return 1;
-}
-
-static int g_indexer_comp_f16 = 1;
-
-int ds4_gpu_indexer_comp_f16_set(int enabled) {
-    g_indexer_comp_f16 = enabled ? 1 : 0;
-    return 1;
-}
-
-int ds4_gpu_indexer_comp_f16_get(void) {
-    return g_indexer_comp_f16;
 }
 
 int ds4_gpu_indexer_comp_f32_to_f16(ds4_gpu_tensor       *dst_f16,
