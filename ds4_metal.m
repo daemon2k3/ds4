@@ -17424,10 +17424,16 @@ int ds4_gpu_indexer_score_one_tensor(
             const bool score_llt =
                 getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
             const bool score_nsg4 = getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL;
-            id<MTLComputePipelineState> direct_pipeline = score_llt
-                ? ds4_gpu_get_pipeline(score_nsg4 ? "kernel_dsv4_indexer_scores_llt_nsg4"
-                                                  : "kernel_dsv4_indexer_scores_llt")
-                : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
+            id<MTLComputePipelineState> direct_pipeline;
+            if (score_llt && getenv("DS4_METAL_DISABLE_INDEXER_LLT_F3") != NULL) {
+                direct_pipeline = ds4_gpu_get_pipeline(
+                        score_nsg4 ? "kernel_dsv4_indexer_scores_llt_nsg4_pre"
+                                   : "kernel_dsv4_indexer_scores_llt_pre");
+            } else {
+                direct_pipeline = score_llt
+                    ? ds4_gpu_get_pipeline(score_nsg4 ? "kernel_dsv4_indexer_scores_llt_nsg4"
+                                                      : "kernel_dsv4_indexer_scores_llt")
+                    : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
@@ -17603,6 +17609,13 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             "kernel_dsv4_indexer_scores_llt";
         if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
             llt_name = "kernel_dsv4_indexer_scores_llt_nsg4";
+        }
+        /* A/B vs pre-F3 shape (scalar staging, single Q bank):
+         * DS4_METAL_DISABLE_INDEXER_LLT_F3=1 */
+        if (getenv("DS4_METAL_DISABLE_INDEXER_LLT_F3") != NULL) {
+            static char llt_name_pre[64];
+            snprintf(llt_name_pre, sizeof(llt_name_pre), "%s_pre", llt_name);
+            llt_name = llt_name_pre;
         }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
@@ -28689,6 +28702,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
+        /* A/B rollback: DS4_METAL_DISABLE_PREFILL_RB16=1 restores the
+         * single-row heads8 prefill path (identical math per-row sequence). */
+        const bool prefill_rb16 = getenv("DS4_METAL_DISABLE_PREFILL_RB16") == NULL;
         const bool prefill_dual_heads =
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             n_head == 64u &&
@@ -28701,11 +28717,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
                 "kernel_dsv4_indexed_mixed_attention_heads8_split") :
-            !prefill_dual_heads ?
+            prefill_dual_heads ?
+            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
+            prefill_rb16 ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads16_dual");
+            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads8");
         id<MTLComputePipelineState> split_reduce_pipeline = split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_reduce_pipeline,
@@ -28838,7 +28857,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(prefill_dual_heads ? 1u : 16u) *
+            [enc setThreadgroupMemoryLength:(decode_one_token || (prefill_rb16 && !prefill_dual_heads) ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:

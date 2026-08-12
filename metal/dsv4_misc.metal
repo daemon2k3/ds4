@@ -6332,7 +6332,7 @@ kernel void kernel_dsv4_indexer_scores_tiled(
  * matrix steps over depth 128 in ascending order, relu then w*scale per
  * head in ascending head order, and ds4's causal (-inf) epilogue for
  * multi-token (prefill) calls / all-rows pass-through for decode. */
-template <int NBPTG, int T_NSG>
+template <int NBPTG, int T_NSG, uint32_t PRE>
 kernel void kernel_dsv4_indexer_scores_llt_impl(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -6402,26 +6402,41 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
         // Double-buffered Q: stage tile t+1 into the alternate sq/sw bank
         // while tile t's MMA consumes the current bank (device-latency hidden).
         constexpr uint NTILE = NH / NHPTG;
-        // Pre-stage head tile 0 into bank 0.
-        for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
-            const uint ih = i4 / DK;
-            const uint d  = i4 - ih*DK;   // multiple of 4
-            device const float *qh = (device const float *)(pq +
-                (uint64_t)ih * args.q_head_stride);
-            *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
-        }
-        if (tiitg < NHPTG) {
-            sw[tiitg] = pw[tiitg] * args.scale;
+        if (PRE == 0u) {
+            // Pre-stage head tile 0 into bank 0 (vectorized staging).
+            for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+                const uint ih = i4 / DK;
+                const uint d  = i4 - ih*DK;   // multiple of 4
+                device const float *qh = (device const float *)(pq +
+                    (uint64_t)ih * args.q_head_stride);
+                *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
+            }
+            if (tiitg < NHPTG) {
+                sw[tiitg] = pw[tiitg] * args.scale;
+            }
+        } else {
+            // PRE (DS4_METAL_DISABLE_INDEXER_LLT_F3): single bank + scalar
+            // staging — the pre-F3 shape, bit-exact MMA inputs.
+            for (uint i = tiitg; i < NHPTG*DK; i += NTG) {
+                const uint ih = i / DK;
+                const uint d  = i - ih*DK;
+                device const float *qh = (device const float *)(pq +
+                    (uint64_t)ih * args.q_head_stride);
+                sq[i] = half(qh[d]);
+            }
+            if (tiitg < NHPTG) {
+                sw[tiitg] = pw[tiitg] * args.scale;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint tile = 0; tile < NTILE; tile++) {
             const uint cur = tile & 1u;
-            threadgroup half  *sqc = sq + cur * NHPTG*DK;
-            threadgroup float *swc = sw + cur * NHPTG;
+            threadgroup half  *sqc = sq + (PRE == 0u ? cur : 0u) * NHPTG*DK;
+            threadgroup float *swc = sw + (PRE == 0u ? cur : 0u) * NHPTG;
             // Prefetch tile t+1 into the other bank (no barrier needed yet:
             // the MMA below reads the other bank exclusively).
-            if (tile + 1 < NTILE) {
+            if (PRE == 0u && tile + 1 < NTILE) {
                 const uint nxt_head = (tile + 1) * NHPTG;
                 threadgroup half  *sqn = sq + (cur ^ 1u) * NHPTG*DK;
                 threadgroup float *swn = sw + (cur ^ 1u) * NHPTG;
@@ -6472,10 +6487,14 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
 
 typedef decltype(kernel_dsv4_indexer_scores_llt_impl<1,1>) kernel_dsv4_llt_t;
 /* Default NBPTG=8; 16 and 32 trade grid occupancy for amortized K staging. */
-template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8>;
-template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8>;
-template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8>;
-template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
+template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, 0>;
+template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8, 0>;
+template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8, 0>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4, 0>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_pre")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, 1>;
+template [[host_name("kernel_dsv4_indexer_scores_llt16_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8, 1>;
+template [[host_name("kernel_dsv4_indexer_scores_llt32_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8, 1>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4_pre")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4, 1>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
