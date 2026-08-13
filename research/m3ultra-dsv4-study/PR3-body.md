@@ -50,3 +50,8 @@ Honest gaps: precision interplay with the existing NAX/quality paths (M5-gated; 
 Branch: `daemon2k3/ds4:code-layer-wins` (tip `594757c`). Recommended reading order: the big host-side commit, then the kernel commit, then the zero-copy/C1 commits. Rollback flags follow the engine's one-env-per-change convention where applicable (`DS4_DISABLE_ZEROCOPY_PAYLOAD_SPANS`; `DS4_SAMPLE_ACCELERATE_EXP` is itself an opt-in).
 
 Open upstream-prep question kept from the session: the slot-order bias in the bench ABBA harness (separate issue with exact repro lines included).
+
+## Evidence
+
+A/B ledger, dump-diff protocol table, C1 (vvexpf) micro-data, the toggle-series bisect kill-chain, and ops notes: `research/m3ultra-dsv4-study/evidence/README.md` (same fork, `research` branch).
+
