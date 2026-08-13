@@ -51,11 +51,12 @@ Method: per variant, run ds4-cli on deterministic prompt with
 | toggle-era series f94be50..a3b5d1b | all-NaN (archived `toggle-attempts-ref`) |
 | `code-layer-wins` tip 594757c | clean |
 
-Latest one-run evidence pair (408.91 t/s prefill both):
+Latest one-run evidence pair (identical 96-word prompt, one run per build,
+408.91 t/s prefill on both; deterministic dumps):
 
 ```
-base@594757c  sha256(result_output) = 0f03e8ec...00c9
-tip @594757c (second annotated state) = c991f1e5...191b
+factory LLT d5c8fd0               sha256 = 0f03e8ec8154...00c9
+code-layer-wins tip 594757c       sha256 = c991f1e5d184...191b
 ```
 NOTE as disclosed: deterministic per build/per lineage; junk-word prompts
 diverge between builds (the whole-vocab drift json-broadcast layout) — fib-class
