@@ -122,3 +122,24 @@ Core reproduction on a Mac with the model file: build at `84cc882+`, run `ds4-be
 ## References
 
 - antirez/ds4 (engine + speed-bench/* + gguf recipes); llama.cpp (ggml Metal backend heritage incl. `kernel_lightning_indexer`); DeepSeek V4 Flash model card (deepseek-ai/HF); DeepGEMM (fp8 indexer logits); antirez/deepseek-v4-gguf (quant recipes; ~966k downloads).
+
+## Appendix A — second-phase campaign (code-layer wins, August 12–13 update)
+
+A second campaign of code-level (non-algorithmic) optimizations delivered on the same codebase, verified with the same session-standard A/B method:
+
+| item | mechanism | measured |
+|---|---|---|
+| rb16 attention dispatch prefill | replace per-row staged `heads8` (2 threadgroup barriers/row) with `heads8_rb16` (16 staged rows per stage) — identical math/order | part of the +5.2% cold prefill @117k ctx |
+| LLT K/Q staging vectorization | float4→half4 staging mirroring its NAX sibling | part of decode/prefill gains |
+| F3 double-buffered Q | stage tile t+1 while MMAing tile t (device-latency hidden) | decode +3.9% @117k; TTFT −8%; prefill −5.2% |
+| simd_max reducers | replace 7-barrier tree max-reduce at 5 finalize/quantize/verify sites; IEEE max is exact ⇒ bit-identical | decode −1–2% |
+| host getenv cache | process-lifetime env snapshot (~200–400 linear scans/token) | class (a) |
+| session verify scratch | session-owned 2×vocab verify-logit buffers (was a 1.3–2.6 MB xmalloc/free per verify cycle) | class (a) |
+| tokenizer literal lens | precomputed sizeof-literal vs strlen-per-byte at ingest | prompt-ingest ms-scale |
+| KV-store refresh gating | default OFF after discovering the st_mtime second-resolution lineage trap | (negative-fix) |
+| zero-copy payload spans | fwrite/fread straight into unified-memory Metal tensor backing stores, fenced | warm restore 11.4 s vs 12.7–19.2 s @30k ctx |
+| C1 vvexpf sampling path | Accelerate vForce vvexpf = 0.35 ns/op vs scalar expf = 1.29 ns/op — opt-in only (`DS4_SAMPLE_ACCELERATE_EXP` — changes the sampling stream by construction) | micro 3.7× |
+
+Negative results from the same campaign (also documented): toggle-region runtime-arg kernels (Metal-run broken states/all-NaN prefill at second-chunk — archived at tag `toggle-attempts-ref`), F2 f16 indexer compressed-K cache (nondeterministic at depth — parked on branch `indexer-comp-f16`), and the bench-ABBA slot-order bias (bit-exact A/B impossible on this config — harness artifact, reprod path documented).
+
+The engineering lesson set also includes: symlink-aware rm (159 GiB model file deleted via rm-through-symlink, restored & sha256-verified), APFS local-snapshot pinning, disk-budget sentinel (`/tmp/DSK_SATURATED` + experimenter launch gate — guard at 90% used), and the dump-cap discipline (DS4_METAL_GRAPH_DUMP_POS + NAME gating near 1M-token contexts).
